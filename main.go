@@ -12,6 +12,8 @@ import (
 	"telemetry-collector/db"
 	"telemetry-collector/models"
 
+	"net/http"
+
 	"github.com/nats-io/nats.go"
 )
 
@@ -19,9 +21,10 @@ func main() {
 
 	// STEP 1: Get data from Health form nats
 
-	nc,err:= NatsConnection()
-	if err!=nil{
-		return 
+	nc, err := NatsConnection()
+	if err != nil {
+		fmt.Println("NATS Connection Error:", err)
+		return
 	}
 
 	defer nc.Close()
@@ -33,12 +36,33 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-     process(nc,health) 
-	
+		process(nc, health)
+
+	})
+	if err != nil {
+		fmt.Println("Subscription Error:", err)
+		return
 	}
-)select {}
+	// Register API routes
+	http.HandleFunc("/telemetry", HandleTelemetry)
+	http.HandleFunc("/telemetry/", HandleTelemetryByID)
+	http.HandleFunc("/telemetry/time", HandleTelemetryByTime)
+
+	// Start API server in another goroutine
+	go func() {
+		fmt.Println("API Server running on :8081")
+		err := http.ListenAndServe(":8081", nil)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	select {}
 }
-func process(nc *nats.Conn ,health models.Health) {
+func process(nc *nats.Conn, health models.Health) {
+
+	fmt.Println("process() function started")
+
 	fmt.Println("Health Endpoint Data")
 	fmt.Println("-----------------------------")
 	fmt.Println("Status    :", health.Status)
@@ -183,6 +207,7 @@ if err2 != nil {
 	// STEP 5: Connect PostgreSQL
 
 	// STEP 6: Insert into Database
+	fmt.Println("Insert function started")
 	
 
 	_, err = conn.Exec(
@@ -370,6 +395,19 @@ for rows2.Next() {
 		panic(err)
 	}
 
+		fmt.Printf("%-4d %-18s %-8s %-35s %-18s %-20s\n",
+			id,
+			serviceName,
+			logLevel,
+			message,
+			failureType,
+			eventTime.Format("2006-01-02 15:04:05"),
+		)
+	}
+	data, err = json.Marshal(matched)
+	if err != nil {
+		fmt.Println("faild to convert telemetry event", err)
+		return
 	fmt.Printf("%-4d %-18s %-8s %-35s %-18s %-20s\n",
 		id,
 		serviceName,
@@ -384,12 +422,110 @@ for rows2.Next() {
 		fmt.Println("faild to convert telemetry event",err)
      return 
 	}
-	err=nc.Publish("telemetry.events",data)
-	if err!=nil{
+	err = nc.Publish("telemetry.events", data)
+	if err != nil {
 		fmt.Println("failed to publish telemetry")
 
 	}
 	fmt.Println("telemetry event published sucessfullly")
 
+}
+func HandleTelemetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		conn, err := db.Connect()
+		if err != nil {
+			fmt.Println("Database connection failed:", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer conn.Close(context.Background())
 
+		events, err := services.GetAllTelemetry(conn)
+		if err != nil {
+			fmt.Println("Fetch telemetry error:", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(events)
+
+		return
+
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Here, you'll parse the incoming JSON (telemetry data) from the request
+	var event models.TelemetryEvent
+	err := json.NewDecoder(r.Body).Decode(&event)
+	if err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Now insert the telemetry event into PostgreSQL (use your existing service function)
+	conn, err := db.Connect()
+	if err != nil {
+		fmt.Println("Database Error:", err)
+		http.Error(w, "Database connection error", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close(context.Background())
+
+	err = services.InsertTelemetry(conn, &event)
+	if err != nil {
+		http.Error(w, "Failed to insert telemetry", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	fmt.Fprintln(w, "Telemetry inserted successfully")
+}
+func HandleTelemetryByID(w http.ResponseWriter, r *http.Request) {
+
+	id := r.URL.Path[len("/telemetry/"):]
+
+	conn, err := db.Connect()
+	if err != nil {
+		http.Error(w, "Database Error", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close(context.Background())
+
+	event, err := services.GetTelemetryByID(conn, id)
+	if err != nil {
+		http.Error(w, "Telemetry not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(event)
+}
+func HandleTelemetryByTime(w http.ResponseWriter, r *http.Request) {
+
+	start := r.URL.Query().Get("start")
+	end := r.URL.Query().Get("end")
+	if start == "" || end == "" {
+		http.Error(w, "Both start and end query parameters are required", http.StatusBadRequest)
+		return
+	}
+	conn, err := db.Connect()
+	if err != nil {
+		http.Error(w, "Database Error", http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close(context.Background())
+
+	events, err := services.GetTelemetryByTime(conn, start, end)
+	if err != nil {
+		http.Error(w, "Failed to fetch telemetry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
 }
